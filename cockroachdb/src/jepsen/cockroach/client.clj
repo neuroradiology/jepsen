@@ -86,11 +86,12 @@
                (util/timeout max-timeout
                              (throw (RuntimeException.
                                       (str "Connection to " node " timed out")))
-                             (let [spec (db-conn-spec node)
-                                   conn (j/get-connection spec)
-                                   spec' (j/add-connection spec conn)]
-                               (assert spec')
-                               spec')))
+                             (util/retry 0.1
+                               (let [spec (db-conn-spec node)
+                                     conn (j/get-connection spec)
+                                     spec' (j/add-connection spec conn)]
+                                 (assert spec')
+                                 spec'))))
        :close close-conn
        :log? true})))
 
@@ -240,7 +241,7 @@
   [client]
   (util/timeout 60000 (throw (RuntimeException. "Timed out waiting for conn"))
                 (while (try
-                         (rc/with-conn [c client]
+                         (with-conn [c client]
                            (j/query c ["select 1"])
                            false)
                          (catch RuntimeException e
@@ -303,7 +304,7 @@
 (defn split!
   "Split the given table at the given key."
   [conn table k]
-  (query conn [(str "alter table " (name table) " split at ("
+  (query conn [(str "alter table " (name table) " split at values ("
                     (if (number? k)
                       k
                       (str "'" k "'"))

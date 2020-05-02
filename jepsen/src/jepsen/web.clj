@@ -6,6 +6,7 @@
             [clojure.java.io :as io]
             [clojure.tools.logging :refer :all]
             [clojure.pprint :refer [pprint]]
+            [clj-time.format :as timef]
             [hiccup.core :as h]
             [ring.util.response :as response]
             [org.httpkit.server :as server])
@@ -21,6 +22,17 @@
            (java.util.zip ZipEntry
                           ZipOutputStream)))
 
+(def colors
+  {:ok   "#6DB6FE"
+   :info "#FFAA26"
+   :fail "#FEB5DA"
+   nil   "#eaeaea"})
+
+(def valid-color
+  (comp colors {true     :ok
+                :unknown :info
+                false    :fail}))
+
 ; Path/File protocols
 (extend-protocol io/Coercions
   Path
@@ -31,7 +43,7 @@
   "URL encodes *individual components* of a path, leaving / as / instead of
   encoded."
   [x]
-  (str/replace (java.net.URLEncoder/encode x) #"%2F" "/"))
+  (str/replace (java.net.URLEncoder/encode x "UTF-8") #"%2F" "/"))
 
 (defn fast-tests
   "Abbreviated set of tests"
@@ -42,9 +54,15 @@
                          (try
                            {:name        test-name
                             :start-time  test-time
-                            :results     (store/load-results test-name test-time)}
+                            :results     (store/memoized-load-results test-name test-time)}
                            (catch java.io.FileNotFoundException e
                              ; Incomplete test
+                             {:name       test-name
+                              :start-time test-time
+                              :results    {:valid? :incomplete}})
+                           (catch java.lang.RuntimeException e
+                             ; Um???
+                             (warn e "Unable to parse" test-name test-time)
                              {:name       test-name
                               :start-time test-time
                               :results    {:valid? :incomplete}})))
@@ -86,15 +104,15 @@
 (defn test-row
   "Turns a test map into a table row."
   [t]
-  (let [r (:results t)]
+  (let [r    (:results t)
+        time (->> t
+                  :start-time
+                  (timef/parse   (timef/formatters :basic-date-time))
+                  (timef/unparse (timef/formatters :date-hour-minute-second)))]
     [:tr
      [:td [:a {:href (url t "")} (:name t)]]
-     [:td [:a {:href (url t "")} (:start-time t)]]
-     [:td {:style (str "background: " (case (:valid? r)
-                                        true            "#ADF6B0"
-                                        false           "#F6AEAD"
-                                        :unknown        "#F3F6AD"
-                                                        "#eaeaea"))}
+     [:td [:a {:href (url t "")} time]]
+     [:td {:style (str "background: " (valid-color (:valid? r)))}
       (:valid? r)]
      [:td [:a {:href (url t "results.edn")}    "results.edn"]]
      [:td [:a {:href (url t "history.txt")}    "history.txt"]]
@@ -118,16 +136,24 @@
 (defn dir-cell
   "Renders a File (a directory) for a directory view."
   [^File f]
+  (let [results-file  (io/file f "results.edn")
+        valid?        (try (with-open [r (java.io.PushbackReader.
+                                           (io/reader results-file))]
+                             (:valid? (clojure.edn/read r)))
+                           (catch java.io.FileNotFoundException e
+                             nil)
+                           (catch RuntimeException e
+                             :unknown))]
   [:a {:href (file-url f)
        :style "text-decoration: none;
               color: #000;"}
-   [:div {:style "display: inline-block;
-                 margin: 10px;
-                 padding: 10px;
-                 background: #F4E7B7;
-                 overflow: hidden;
-                 width: 280px;"}
-    (.getName f)]])
+   [:div {:style (str "background: " (valid-color valid?) ";\n"
+                      "display: inline-block;
+                      margin: 10px;
+                      padding: 10px;
+                      overflow: hidden;
+                      width: 280px;")}
+    (.getName f)]]))
 
 (defn file-cell
   "Renders a File for a directory view."
@@ -163,11 +189,27 @@
 
    [:a {:href (file-url f)} (.getName f)]])
 
+(defn dir-sort
+  "Sort a collection of Files. If everything's an integer, sort numerically,
+  else alphanumerically."
+  [files]
+  (if (every? (fn [^File f] (re-find #"^\d+$" (.getName f))) files)
+    (sort-by #(Long/parseLong (.getName %)) files)
+    (sort files)))
+
+(defn js-escape
+  "Escape a javascript string."
+  [s]
+  (-> s
+      (str/replace "'" "\\x27")
+      (str/replace "\"" "\\x22")))
+
 (defn dir
   "Serves a directory."
   [^File dir]
   {:status 200
    :headers {"Content-Type" "text/html"}
+   ; Breadcrumbs
    :body (h/html (->> dir
                       (.toPath)
                       (iterate #(.getParent %))
@@ -179,16 +221,29 @@
                       (drop 1)
                       reverse
                       (map (fn [^Path component]
-                             [:a {:href (file-url component)}
-                                    (.getFileName component)]))
-                      (cons [:a {:href "/"} "jepsen"])
-                      (interpose " / "))
-                 [:h1 (.getName dir)]
+                             [:a {:style "margin: 0 0.3em"
+                                  :href (file-url component)}
+                              (.getFileName component)]))
+                      (cons [:a {:style "margin-right: 0.3em"
+                                 :href  "/"}
+                             "jepsen"])
+                      (interpose "/"))
+                 ; Title
+                 (let [path (js-escape (str \' (.getCanonicalPath dir) \'))]
+                   ; You can click to copy the full local path
+                   [:h1 {:onclick (str "navigator.clipboard.writeText('"
+                                       path "')")}
+                    (.getName dir)
+                    ; Or download a zip file
+                    [:a {:style "font-size: 60%;
+                                margin-left: 0.3em;"
+                         :href (file-url (str dir ".zip"))}
+                     ".zip"]])
                  [:div
                   (->> dir
                        .listFiles
                        (filter (fn [^File f] (.isDirectory f)))
-                       sort
+                       dir-sort
                        (map dir-cell))]
                  [:div
                   (->> dir
@@ -254,20 +309,35 @@
    :headers {"Content-Type" "text/plain"}
    :body "404 not found"})
 
+(def content-type
+  "Map of extensions to known content-types"
+  {"txt"  "text/plain"
+   "log"  "text/plain"
+   "edn"  "text/plain" ; Wrong, but we like seeing it in-browser
+   "json" "text/plain" ; Ditto
+   "html" "text/html"
+   "svg"  "image/svg+xml"})
+
 (defn files
   "Serve requests for /files/ urls"
   [req]
-  (let [pathname ((re-find #"^/files/(.+)$" (:uri req)) 1)
+  (let [pathname ((re-find #"^/files/(.+)\z" (:uri req)) 1)
+        ext      (when-let [m (re-find #"\.(\w+)\z" pathname)] (m 1))
         f    (File. store/base-dir pathname)]
     (assert-file-in-scope! f)
     (cond
       (.isFile f)
-      (response/file-response pathname
-                              {:root             store/base-dir
-                               :index-files?     false
-                               :allow-symlinks?  false})
+      (let [res (response/file-response pathname
+                                        {:root             store/base-dir
+                                         :index-files?     false
+                                         :allow-symlinks?  false})]
+          (if-let [ct (content-type ext)]
+            (-> res
+                (response/content-type ct)
+                (response/charset "utf-8"))
+            res))
 
-      (re-find #"\.zip\z" pathname)
+      (= ext "zip")
       (zip req f)
 
       (.isDirectory f)
@@ -288,5 +358,5 @@
   "Starts an http server with the given httpkit options."
   ([options]
    (let [s (server/run-server app options)]
-     (info "Web server running.")
+     (info "I'll see YOU after the function")
      s)))

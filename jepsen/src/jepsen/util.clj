@@ -2,17 +2,28 @@
   "Kitchen sink"
   (:require [clojure.tools.logging :refer [info]]
             [clojure.core.reducers :as r]
-            [clojure.string :as str]
+            [clojure [string :as str]]
             [clojure.pprint :refer [pprint]]
             [clojure.walk :as walk]
             [clojure.java.io :as io]
             [clj-time.core :as time]
             [clj-time.local :as time.local]
             [clojure.tools.logging :refer [debug info warn]]
+            [dom-top.core :as dt :refer [bounded-future]]
+            [fipp.edn :as fipp]
             [knossos.history :as history])
-  (:import (java.util.concurrent.locks LockSupport)
+  (:import (java.lang.reflect Method)
+           (java.util.concurrent.locks LockSupport)
+           (java.util.concurrent ExecutionException)
            (java.io File
                     RandomAccessFile)))
+
+(defn default
+  "Like assoc, but only fills in values which are NOT present in the map."
+  [m k v]
+  (if (contains? m k)
+    m
+    (assoc m k v)))
 
 (defn exception?
   "Is x an Exception?"
@@ -37,16 +48,27 @@
   "Tries name, falls back to pr-str."
   [x]
   (if (instance? clojure.lang.Named x)
-    (name x))
-    (pr-str x))
+    (name x)
+    (pr-str x)))
+
+(def uninteresting-exceptions
+  "Exceptions which are less interesting; used by real-pmap and other cases where we want to pick a *meaningful* exception."
+  #{java.util.concurrent.BrokenBarrierException
+    InterruptedException})
 
 (defn real-pmap
-  "Like pmap, but launches futures instead of using a bounded threadpool."
+  "Like pmap, but runs a thread per element, which prevents deadlocks when work
+  elements have dependencies. The dom-top real-pmap throws the first exception
+  it gets, which might be something unhelpful like InterruptedException or
+  BrokenBarrierException. This variant works like that real-pmap, but throws
+  more interesting exceptions when possible."
   [f coll]
-  (->> coll
-       (map (fn launcher [x] (future (f x))))
-       doall
-       (map deref)))
+  (let [[results exceptions] (dt/real-pmap-helper f coll)]
+    (when (seq exceptions)
+      (throw (or (first (remove (comp uninteresting-exceptions class)
+                                exceptions))
+                 (first exceptions))))
+    results))
 
 (defn processors
   "How many processors on this platform?"
@@ -57,6 +79,39 @@
   "Given a number, returns the smallest integer strictly greater than half."
   [n]
   (inc (int (Math/floor (/ n 2)))))
+
+(defn min-by
+  "Finds the minimum element of a collection based on some (f element), which
+  returns Comparables. If `coll` is empty, returns nil."
+  [f coll]
+  (when (seq coll)
+    (reduce (fn [m e]
+              (if (pos? (compare (f m) (f e)))
+                e
+                m))
+            coll)))
+
+(defn max-by
+  "Finds the maximum element of a collection based on some (f element), which
+  returns Comparables. If `coll` is empty, returns nil."
+  [f coll]
+  (when (seq coll)
+    (reduce (fn [m e]
+              (if (neg? (compare (f m) (f e)))
+                e
+                m))
+            coll)))
+
+(defn fast-last
+  "Like last, but O(1) on counted collections."
+  [coll]
+  (nth coll (dec (count coll))))
+
+(defn rand-nth-empty
+  "Like rand-nth, but returns nil if the collection is empty."
+  [coll]
+  (try (rand-nth coll)
+       (catch IndexOutOfBoundsException e nil)))
 
 (defn fraction
   "a/b, but if b is zero, returns unity."
@@ -130,37 +185,44 @@
 
 (defn print-history
   "Prints a history to the console."
-  [history]
-  (doseq [op history]
-    (prn-op op)))
+  ([history]
+    (print-history prn-op history))
+  ([printer history]
+   (doseq [op history]
+     (printer op))))
 
 (defn write-history!
   "Writes a history to a file."
-  [f history]
-  (with-open [w (io/writer f)]
-    (binding [*out* w]
-      (print-history history))))
+  ([f history]
+   (write-history! f prn-op history))
+  ([f printer history]
+   (with-open [w (io/writer f)]
+     (binding [*out* w]
+       (print-history printer history)))))
 
 (defn pwrite-history!
   "Writes history, taking advantage of more cores."
-  [f history]
-  (if (or (< (count history) 16384) (not (vector? history)))
-    ; Plain old write
-    (write-history! f history)
-    ; Parallel variant
-    (let [chunks (chunk-vec (Math/ceil (/ (count history) (processors)))
-                            history)
-          files  (repeatedly (count chunks)
-                             #(File/createTempFile "jepsen-history" ".part"))]
-      (try
-        (->> chunks
-             (map (fn [file chunk] (future (write-history! file chunk) file))
-                  files)
-             doall
-             (map deref)
-             (concat-files! f))
-       (finally
-         (doseq [f files] (.delete ^File f)))))))
+  ([f history]
+    (pwrite-history! f prn-op history))
+  ([f printer history]
+   (if (or (< (count history) 16384) (not (vector? history)))
+     ; Plain old write
+     (write-history! f printer history)
+     ; Parallel variant
+     (let [chunks (chunk-vec (Math/ceil (/ (count history) (processors)))
+                             history)
+           files  (repeatedly (count chunks)
+                              #(File/createTempFile "jepsen-history" ".part"))]
+       (try
+         (->> chunks
+              (map (fn [file chunk]
+                     (bounded-future (write-history! file printer chunk) file))
+                   files)
+              doall
+              (map deref)
+              (concat-files! f))
+         (finally
+           (doseq [f files] (.delete ^File f))))))))
 
 (defn log-op
   "Logs an operation and returns it."
@@ -179,7 +241,7 @@
 ;(defn all-loggers []
 ;  (->> (org.apache.log4j.LogManager/getCurrentLoggers)
 ;       (java.util.Collections/list)
-;       (cons (org.apache.log4j.LogManager/getRootLogger)))) 
+;       (cons (org.apache.log4j.LogManager/getRootLogger))))
 
 (defn all-jdk-loggers []
   (let [manager (java.util.logging.LogManager/getLogManager)]
@@ -237,6 +299,7 @@
   "Binds *relative-time-origin* at the start of body."
   [& body]
   `(binding [*relative-time-origin* (linear-time-nanos)]
+     (info "Relative time begins now")
      ~@body))
 
 (defn relative-time-nanos
@@ -258,31 +321,23 @@
     ~@body
      (nanos->ms (- (System/nanoTime) t0#))))
 
-(defn spy [x]
-  (info (with-out-str (pprint x)))
-  x)
+(defn pprint-str [x]
+  (with-out-str (fipp/pprint x {:width 78})))
 
-(defmacro unwrap-exception
-  "Catches exceptions from body and re-throws their causes. Useful when you
-  don't want the wrapper from, say, a future's exception handler."
-  [& body]
-  `(try ~@body
-        (catch Throwable t#
-          (throw (.getCause t#)))))
+(defn spy [x]
+  (info (pprint-str x))
+  x)
 
 (defmacro timeout
   "Times out body after n millis, returning timeout-val."
   [millis timeout-val & body]
-  `(let [thread# (promise)
-         worker# (future
-                   (deliver thread# (Thread/currentThread))
-                   ~@body)
-         retval# (unwrap-exception
-                   (deref worker# ~millis ::timeout))]
+  `(let [worker# (future ~@body)
+         retval# (try
+                   (deref worker# ~millis ::timeout)
+                   (catch ExecutionException ee#
+                     (throw (.getCause ee#))))]
      (if (= retval# ::timeout)
-       (do ; Can never remember which does which
-           (.interrupt @thread#)
-           (future-cancel worker#)
+       (do (future-cancel worker#)
            ~timeout-val)
        retval#)))
 
@@ -463,10 +518,20 @@
   [f m]
   (into {} (r/map f m)))
 
+(defn map-keys
+  "Maps keys in a map."
+  [f m]
+  (map-kv (fn [[k v]] [(f k) v]) m))
+
 (defn map-vals
   "Maps values in a map."
   [f m]
   (map-kv (fn [[k v]] [k (f v)]) m))
+
+(defn compare<
+  "Like <, but works on any comparable objects, not just numbers."
+  [a b]
+  (neg? (compare a b)))
 
 (defn poly-compare
   "Comparator function for sorting heterogenous collections."
@@ -534,8 +599,9 @@
                   s))))))
 
 (defn coll
-  "Wraps non-coll things into singleton lists, and leaves colls as themselves.
-  Useful when you can take either a single thing or a sequence of things."
+  "Wraps non-collection things into singleton lists, and leaves colls as
+  themselves. Useful when you can take either a single thing or a sequence of
+  things."
   [thing-or-things]
   (cond (nil? thing-or-things)  nil
         (coll? thing-or-things) thing-or-things
@@ -587,23 +653,52 @@
          persistent!)))
 
 (defn nemesis-intervals
-  "Given a history where a nemesis goes through :f :start and :f :stop
-  transitions, constructs a sequence of pairs of :start and :stop ops. Since a
+  "Given a history where a nemesis goes through :f :start and :f :stop type
+  transitions, constructs a sequence of pairs of start and stop ops. Since a
   nemesis usually goes :start :start :stop :stop, we construct pairs of the
   first and third, then second and fourth events. Where no :stop op is present,
-  we emit a pair like [start nil]."
-  [history]
-  (let [[pairs starts] (->> history
-                            (filter #(= :nemesis (:process %)))
-                            (reduce (fn [[pairs starts] op]
-                                      (case (:f op)
-                                        :start [pairs (conj starts op)]
-                                        :stop  [(conj pairs [(peek starts)
-                                                             op])
-                                                (pop starts)]
-                                        [pairs starts]))
-                                    [[] (clojure.lang.PersistentQueue/EMPTY)]))]
-    (concat pairs (map vector starts (repeat nil)))))
+  we emit a pair like [start nil]. Optionally, a map of start and stop sets may
+  be provided to match on user-defined :start and :stop keys.
+
+  Multiple starts are ended by the same pair of stops, so :start1 :start2
+  :start3 :start4 :stop1 :stop2 yields:
+
+    [start1 stop1]
+    [start2 stop2]
+    [start3 stop1]
+    [start4 stop2]"
+  ([history]
+   (nemesis-intervals history {}))
+  ([history opts]
+   ;; Default to :start and :stop if no region keys are provided
+   (let [start (:start opts #{:start})
+         stop  (:stop  opts #{:stop})
+         [intervals starts]
+         ; First, group nemesis ops into pairs (one for invoke, one for
+         ; complete)
+         (->> history
+              (filter #(= :nemesis (:process %)))
+              (partition 2)
+              ; Verify that every pair has identical :fs. It's possible
+              ; that nemeses might, some day, log more types of :info
+              ; ops, maybe not in a call-response pattern, but that'll
+              ; break us.
+              (filter (fn [[a b]] (= (:f a) (:f b))))
+              ; Now move through all nemesis ops, keeping track of all start
+              ; pairs, and closing those off when we see a stop pair.
+              (reduce (fn [[intervals starts :as state] [a b :as pair]]
+                        (let [f (:f a)]
+                          (cond (start f)  [intervals (conj starts pair)]
+                                (stop f)   [(->> starts
+                                                 (mapcat (fn [[s1 s2]]
+                                                           [[s1 a] [s2 b]]))
+                                                 (into intervals))
+                                            []]
+                                true        state)))
+                      [[] []]))]
+     ; Complete unfinished intervals
+     (into intervals (mapcat (fn [[s1 s2]] [[s1 nil] [s2 nil]]) starts)))))
+
 
 (defn longest-common-prefix
   "Given a collection of sequences, finds the longest sequence which is a
@@ -628,3 +723,122 @@
                              (count (longest-common-prefix cs))
                              (map (comp dec count) cs)))
        cs))
+
+(definterface ILazyAtom
+  (init []))
+
+(defn lazy-atom
+  "An atom with lazy state initialization. Calls (f) on first use to provide
+  the initial value of the atom. Only supports swap/reset/deref. Reset bypasses
+  lazy initialization. If f throws, behavior is undefined (read: proper
+  fucked)."
+  [f]
+  (let [state ^clojure.lang.Atom (atom ::fresh)]
+    (reify
+      ILazyAtom
+      (init [_]
+        (let [s @state]
+          (if-not (identical? s ::fresh)
+            ; Regular old value
+            s
+
+            ; Someone must initialize. Everyone form an orderly queue.
+            (do (locking state
+                  (if (identical? @state ::fresh)
+                    ; We're the first.
+                    (reset! state (f))))
+
+                ; OK, definitely initialized now.
+                @state))))
+
+      clojure.lang.IAtom
+      (swap [this f]
+        (.init this)
+        (.swap state f))
+      (swap [this f a]
+        (.init this)
+        (.swap state f a))
+      (swap [this f a b]
+        (.init this)
+        (.swap state f a b))
+      (swap [this f a b more]
+        (.init this)
+        (.swap state f a b more))
+
+      (compareAndSet [this v v']
+        (.init this)
+        (.compareAndSet state v v'))
+
+      (reset [this v]
+        (.reset state v))
+
+      clojure.lang.IDeref
+      (deref [this]
+        (.init this)))))
+
+(defn named-locks
+  "Creates a mutable data structure which backs a named locking mechanism.
+
+  Named locks are helpful when you need to coordinate access to a dynamic pool
+  of resources. For instance, you might want to prohibit multiple threads from
+  executing a command on a remote node at once. Nodes are uniquely identified
+  by a string name, so you could write:
+
+      (defonce node-locks (named-locks))
+
+      ...
+      (defn start-db! [node]
+        (with-named-lock node-locks node
+          (c/exec :service :meowdb :start)))
+
+  Now, concurrent calls to start-db! will not execute concurrently.
+
+  The structure we use to track named locks is an atom wrapping a map, where
+  the map's keys are any object, and the values are canonicalized versions of
+  that same object. We use standard Java locking on the canonicalized versions.
+  This is basically an arbitrary version of string interning."
+  []
+  (atom {}))
+
+(defn get-named-lock!
+  "Given a pool of locks, and a lock name, returns the object used for locking
+  in that pool. Creates the lock if it does not already exist."
+  [locks name]
+  (-> locks
+      (swap! (fn [locks]
+               (if-let [o (get locks name)]
+                 locks
+                 (assoc locks name name))))
+      (get name)))
+
+(defmacro with-named-lock
+  "Given a lock pool, and a name, locks that name in the pool for the duration
+  of the body."
+  [locks name & body]
+  `(locking (get-named-lock! ~locks ~name) ~@body))
+
+(defn contains-many?
+  "Takes a map and any number of keys, returning true if all of the keys are
+  present. Ex. (contains-many? {:a 1 :b 2 :c 3} :a :b :c) => true"
+  [m & ks]
+  (every? #(contains? m %) ks))
+
+(defn parse-long
+  "Parses a string to a Long. Look, we use this a lot, okay?"
+  [s]
+  (Long/parseLong s))
+
+(defn ex-root-cause
+  "Unwraps throwables to return their original cause."
+  [^Throwable t]
+  (if-let [cause (.getCause t)]
+    (recur cause)
+    t))
+
+(defn arities
+  "The arities of a function class."
+  [^Class c]
+  (keep (fn [^Method method]
+          (when (re-find #"invoke" (.getName method))
+            (alength (.getParameterTypes method))))
+        (-> c .getDeclaredMethods)))

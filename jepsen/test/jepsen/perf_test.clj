@@ -1,13 +1,12 @@
 (ns jepsen.perf-test
-    (:use jepsen.core
-                  clojure.test
-                  clojure.pprint)
+  (:refer-clojure :exclude [run!])
+  (:use clojure.test)
   (:require [jepsen.os :as os]
             [jepsen.db :as db]
             [jepsen.client :as client]
             [jepsen.generator :as gen]
-            [jepsen.model :as model]
-            [jepsen.checker :as checker]))
+            [jepsen.checker :as checker]
+            [knossos.model :as model]))
 
 (deftest perf-test
   (let [history [{:process 3, :type :invoke, :f :read}
@@ -131,8 +130,7 @@
                  {:process 1, :type :fail, :f :cas, :value [2 2]}
                  {:process 2, :type :fail, :f :cas, :value [4 3]}]]
     (time
-      (is (:valid? (checker/check checker/linearizable
-                                  {}
-                                  (model/->CASRegister 0)
-                                  history
-                                  {}))))))
+     (is (:valid? (checker/check (checker/linearizable {:model (model/->CASRegister 0)})
+                                 {}
+                                 history
+                                 {}))))))

@@ -50,7 +50,6 @@
    "big-skews"                  `(cln/big-skews)
    "huge-skews"                 `(cln/huge-skews)
    "strobe-skews"               `(cln/strobe-skews)
-   "slow"                       `(cln/slow 250)
    "split"                      `(cln/split)
 ;   "start-stop"                 `(cln/startstop 1)
    "start-stop-2"               `(cln/startstop 2)
@@ -85,7 +84,7 @@
     :parse-fn #(Long/parseLong %)
     :validate [pos? "Must be positive"]]
 
-   (jc/tarball-opt "https://binaries.cockroachdb.com/cockroach-beta-20160829.linux-amd64.tgz")])
+   (jc/tarball-opt "https://binaries.cockroachdb.com/cockroach-beta-20170330.linux-amd64.tgz")])
 
 (defn log-test
   [t]

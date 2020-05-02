@@ -4,7 +4,7 @@
 (refer to https://wiki.debian.org/LXC)
 
 ```sh
-aptitude install lxc bridge-utils libvirt-bin debootstrap dnsmasq
+aptitude install lxc bridge-utils ebtables libvirt-bin debootstrap dnsmasq
 ```
 
 Add this line to /etc/fstab:
@@ -156,9 +156,10 @@ Enable password-based login for root (used by jsch):
 ```sh
 sed  -i 's,^PermitRootLogin .*,PermitRootLogin yes,g' /etc/ssh/sshd_config
 systemctl restart sshd
+apt install sudo
 ```
 
-[Remove systemd](http://without-systemd.org/wiki/index.php/How_to_remove_systemd_from_a_Debian_jessie/sid_installation).
+[Remove systemd](http://without-systemd.org/wiki/index.php/How_to_remove_systemd_from_a_Debian_jessie/sid_installation). After you install sysvinit-core and sysvinit-utils, you may have to restart the container with /lib/sysvinit/init argument to lxc-start before apt will allow you to remove systemd.
 
 Detach from the container with Control+a q, and repeat for the remaining nodes.
 
@@ -189,15 +190,15 @@ And that should mostly do it, I think.
 
 Follow generally the same steps as for Debian, but the process is easier. Reference: https://help.ubuntu.com/lts/serverguide/lxc.html
 
-* right after you have installed LXC, create or open /etc/lxc/dnsmasq.conf and add the following contents:
+* Right after you have installed LXC, create or open /etc/lxc/dnsmasq.conf and add the following contents:
 
-  ```
+```
 dhcp-host=n1,10.0.3.101
 dhcp-host=n2,10.0.3.102
 dhcp-host=n3,10.0.3.103
 dhcp-host=n4,10.0.3.104
 dhcp-host=n5,10.0.3.105
-  ```
+```
 
 10.0.3.* is LXC's default network. If you want others, go for it but you'll have to change it in the main configuration for lxc as well.
 

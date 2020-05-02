@@ -1,12 +1,12 @@
 (ns jepsen.os.smartos
   "Common tasks for SmartOS boxes."
-  (:use clojure.tools.logging)
   (:require [clojure.set :as set]
+            [clojure.tools.logging :refer [info]]
             [jepsen.util :refer [meh]]
             [jepsen.os :as os]
             [jepsen.control :as c]
             [jepsen.control.util :as cu]
-            [jepsen.control.net :as net]
+            [jepsen.net :as net]
             [clojure.string :as str]))
 
 (defn setup-hostfile!
@@ -95,7 +95,7 @@
      (for [[pkg version] pkgs]
        (when (not= version (installed-version pkg))
          (info "Installing" pkg version)
-         (c/exec :pkgin :-y :install 
+         (c/exec :pkgin :-y :install
                  (str (name pkg) "-" version)))))
 
                                         ; Install any version
@@ -127,6 +127,6 @@
       (c/su
        (c/exec :svcadm :enable :-r :ipfilter))
 
-      (meh (net/heal)))
+      (meh (net/heal! (:net test) test)))
 
     (teardown! [_ test node])))

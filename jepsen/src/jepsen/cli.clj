@@ -9,10 +9,13 @@
             [clojure.tools.logging :refer :all]
             [clojure.string :as str]
             [clojure.java.io :as io]
-            [jepsen.core :as jepsen]
-            [jepsen.web :as web]))
+            [dom-top.core :refer [assert+]]
+            [jepsen [core :as jepsen]
+                    [store :as store]
+                    [util :as util :refer [map-vals]]
+                    [web :as web]]))
 
-(def default-nodes [:n1 :n2 :n3 :n4 :n5])
+(def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
 (defn one-of
   "Takes a collection and returns a string like \"Must be one of ...\" and a
@@ -54,7 +57,10 @@
 
   [help-opt
 
-   (repeated-opt "-n" "--node HOSTNAME" "Node(s) to run test on" default-nodes)
+   (repeated-opt "-n" "--node HOSTNAME" "Node(s) to run test on. Flag may be submitted many times, with one node per flag." default-nodes)
+
+   [nil "--nodes NODE_LIST" "Comma-separated list of node hostnames."
+    :parse-fn #(str/split % #",\s*")]
 
    [nil "--nodes-file FILENAME" "File containing node hostnames, one per line."]
 
@@ -74,6 +80,12 @@
     :validate [(partial re-find #"^\d+n?$")
                "Must be an integer, optionally followed by n."]]
 
+   [nil "--leave-db-running" "Leave the database running at the end of the test., so you can inspect it."
+    :default false]
+
+   [nil "--logging-json" "Use JSON structured output in the Jepsen log."
+    :default false]
+
    [nil "--test-count NUMBER"
     "How many times should we repeat a test?"
     :default  1
@@ -86,12 +98,19 @@
     :parse-fn #(Long/parseLong %)
     :validate [pos? "Must be positive"]]])
 
+(defn package-opt
+  ([default]
+   (package-opt "package-url" default))
+  ([option-name default]
+   [nil (str "--" option-name " URL")
+    "URL for the DB package (a zip file or tarball) to install. May be either HTTP, HTTPS, or a local file present on each of the DB nodes. For instance, --tarball https://foo.com/db.tgz, or file:///tmp/db.zip"
+    :default default
+    :validate [(partial re-find #"^(file|https?)://.*\.(tar|tgz|zip)")
+               "Must be a file://, http://, or https:// URL including .tar, .tgz, or .zip"]]))
+
 (defn tarball-opt
   [default]
-  ["-u" "--tarball URL" "URL for the DB tarball to install. May be either HTTP, HTTPS, or a local file present on each of the DB nodes. For instance, --tarball https://foo.com/db.tgz, or file:///tmp/db.tgz"
-   :default default
-   :validate [(partial re-find #"^(file|https?)://.*\.(tar|tgz)")
-              "Must be a file://, http://, or https:// URL including .tar or .tgz"]])
+  (package-opt "tarball" default))
 
 (defn test-usage
   []
@@ -101,6 +120,7 @@ Runs a Jepsen test and exits with a status code:
 
   0     All tests passed
   1     Some test failed
+  2     Some test had an :unknown validity
   254   Invalid arguments
   255   Internal Jepsen error
 
@@ -131,6 +151,43 @@ Options:\n")
                    1)]
         (assoc-in parsed [:options :concurrency]
                   (* unit (Long/parseLong integer)))))))
+
+(defn parse-nodes
+  "Takes a parsed map and merges all the various node specifications together.
+  In particular:
+
+  - If :nodes-file and :nodes are blank, and :node is the default node list,
+    uses the default node list.
+  - Otherwise, merges together :nodes-file, :nodes, and :node into a single
+    list.
+
+  The new parsed map will have a merged nodes list in :nodes, and lose
+  :nodes-file and :node options."
+  [parsed]
+  (let [options       (:options parsed)
+        node          (:node        options)
+        nodes         (:nodes       options)
+        nodes-file    (:nodes-file  options)
+
+        ; If --node is still left at the default
+        default-node? (identical? node default-nodes)
+        ; ... and other options were given...
+        override?     (or nodes nodes-file)
+        ; Then drop the default node list
+        node          (if (and default-node? override?) nil node)
+
+        ; Read nodes-file nodes
+        nodes-file    (when nodes-file
+                        (str/split (slurp nodes-file) #"\s*\n\s*"))
+
+        ; Construct full node list
+        all-nodes     (->> (concat nodes-file
+                                   nodes
+                                   node)
+                           vec)]
+    (assoc parsed :options (-> options
+                               (dissoc :node :nodes-file)
+                               (assoc  :nodes all-nodes)))))
 
 (defn rename-keys
   "Given a map m, and a map of keys to replacement keys, yields m with keys
@@ -166,29 +223,16 @@ Options:\n")
                        :strict-host-key-checking
                        :private-key-path)))))
 
-(defn read-nodes-file
-  "Takes a parsed map. If :nodes-file exists, reads its contents and appends
-  them to :nodes. Drops the default nodes list if it's still there."
-  [parsed]
-  (let [options (:options parsed)]
-    (assoc parsed :options
-           (if-let [f (:nodes-file options)]
-             (let [nodes (:nodes options)
-                   nodes (if (identical? nodes default-nodes)
-                           []
-                           nodes)
-                   nodes (into nodes (str/split (slurp f) #"\s*\n\s*"))]
-               (assoc options :nodes nodes))
-             options))))
 
 (defn test-opt-fn
   "An opt fn for running simple tests. Remaps ssh keys, remaps :node to :nodes,
   reads :nodes-file into :nodes, and parses :concurrency."
   [parsed]
   (-> parsed
-      (rename-options {:node :nodes})
       rename-ssh-options
-      read-nodes-file
+      (rename-options {:leave-db-running :leave-db-running?})
+      (rename-options {:logging-json :logging-json?})
+      parse-nodes
       parse-concurrency))
 
 ;; Test runner
@@ -285,7 +329,9 @@ Options:\n")
                    (web/serve! options)
                    (info (str "Listening on http://"
                               (:ip options) ":" (:port options) "/"))
-                   (while true (Thread/sleep 1000)))}})
+                   (loop [] (do
+                              (Thread/sleep 1000)
+                              (recur))))}})
 
 (defn single-test-cmd
   "A command which runs a single test with standard built-ins. Options:
@@ -297,7 +343,12 @@ Options:\n")
    :tarball If present, adds a --tarball option to this command, defaulting to
             whatever URL is given here.
    :usage   Defaults to `jc/test-usage`. Optional.
-   :test-fn A function that receives the option map and constructs a test.}"
+   :test-fn A function that receives the option map and constructs a test.}
+
+  This comes with two commands: `test`, which runs a test and analyzes it, and
+  `analyze`, which constructs a test map using the same arguments as `run`, but
+  analyzes a history from disk instead.
+  "
   [opts]
   (let [opt-spec (into test-opt-spec (:opt-spec opts))
         opt-spec (if-let [default-tarball (:tarball opts)]
@@ -309,19 +360,135 @@ Options:\n")
                    opt-spec)
         opt-fn  (if (:tarball opts)
                   (comp test-opt-fn validate-tarball)
-                  test-opt-fn)]
+                  test-opt-fn)
+        opt-fn  (if-let [f (:opt-fn opts)]
+                  (comp f opt-fn)
+                  opt-fn)
+        test-fn (:test-fn opts)]
   {"test" {:opt-spec opt-spec
-           :opt-fn   (if-let [f (:opt-fn opts)]
-                       (comp f opt-fn)
-                       opt-fn)
+           :opt-fn   opt-fn
            :usage    (:usage opts test-usage)
            :run      (fn [{:keys [options]}]
                        (info "Test options:\n"
                              (with-out-str (pprint options)))
                        (doseq [i (range (:test-count options))]
-                         (let [test (jepsen/run! ((:test-fn opts) options))]
-                           (when-not (:valid? (:results test))
-                             (System/exit 1)))))}}))
+                         (let [test (jepsen/run! (test-fn options))]
+                           (case (:valid? (:results test))
+                             false    (System/exit 1)
+                             :unknown (System/exit 2)
+                             nil))))}
+
+   "analyze" {:opt-spec opt-spec
+              :opt-fn   opt-fn
+              :usage    (:usage opts test-usage)
+              :run      (fn [{:keys [options]}]
+                          (info "Test options:\n"
+                                (with-out-str (pprint options)))
+                          (let [cli-test    (test-fn options)
+                                stored-test (store/latest)
+                                test (-> stored-test
+                                         (dissoc :results)
+                                         (merge cli-test)
+                                         (assoc :history
+                                                (:history stored-test)))]
+                            (assert+ stored-test IllegalStateException
+                                     "Not sure what the last test was")
+                            (assert+ (= (:name stored-test)
+                                        (:name cli-test))
+                                     IllegalStateException
+                                     (str "Stored test (" (:name stored-test)
+                                          ") and CLI test (" (:name cli-test)
+                                          ") have different names; aborting"))
+
+                            (info "Combined test:\n"
+                                  (-> test
+                                      (update :history (partial take 5))
+                                      (update :history vector)
+                                      (update :history conj '...)
+                                      pprint
+                                      with-out-str))
+
+                            (jepsen/analyze! test)))}}))
+
+(defn test-all-run-tests!
+  "Runs a sequence of tests and returns a map of outcomes (e.g. true, :unknown,
+  :crashed, false) to collections of test folders with that outcome."
+  [tests]
+  (->> tests
+       (map-indexed
+         (fn [i test]
+           (try
+             (let [test' (jepsen/run! test)]
+               [(:valid? (:results test'))
+                (.getPath (store/path test'))])
+             (catch Exception e
+               (warn e "Test crashed")
+               [:crashed (:name test)]))))
+       (group-by first)
+       (map-vals (partial map second))))
+
+(defn test-all-print-summary!
+  "Prints a summary of test outcomes. Takes a map of statuses (e.g. :crashed,
+  true, false, :unknown), to test files. Returns results."
+  [results]
+  (println "\n")
+
+  (when (seq (results true))
+    (println "\n# Successful tests\n")
+    (dorun (map println (results true))))
+
+  (when (seq (results :unknown))
+    (println "\n# Indeterminate tests\n")
+    (dorun (map println (results :unknown))))
+
+  (when (seq (results :crashed))
+    (println "\n# Crashed tests\n")
+    (dorun (map println (results :crashed))))
+
+  (when (seq (results false))
+    (println "\n# Failed tests\n")
+    (dorun (map println (results false))))
+
+  (println)
+  (println (count (results true)) "successes")
+  (println (count (results :unknown)) "unknown")
+  (println (count (results :crashed)) "crashed")
+  (println (count (results false)) "failures")
+
+  results)
+
+(defn test-all-exit!
+  "Takes a map of statuses and exits with an appropriate error code: 255 if any
+  crashed, 2 if any were unknown, 1 if any were invalid, 0 if all passed."
+  [results]
+  (System/exit (cond
+                 (:crashed results)   255
+                 (:unknown results)   2
+                 (get results false)  1
+                 true                 0)))
+
+(defn test-all-cmd
+  "A command that runs a whole suite of tests in one go. Options:
+
+    :opt-spec     A vector of additional options for tools.cli. Appended to
+                  test-opt-spec. Optional.
+    :opt-fn       A function which transforms parsed options. Composed after
+                  test-opt-fn. Optional.
+    :usage        Defaults to `test-usage`. Optional.
+    :tests-fn     A function that receives the transformed option map and
+                  constructs a sequence of tests to run."
+  [opts]
+  {"test-all"
+   {:opt-spec (into test-opt-spec (:opt-spec opts))
+    :opt-fn   test-opt-fn
+    :usage    "Runs all tests"
+    :run      (fn run [{:keys [options]}]
+                (info "CLI options:\n" (with-out-str (pprint options)))
+                (->> options
+                     ((:tests-fn opts))
+                     test-all-run-tests!
+                     test-all-print-summary!
+                     test-all-exit!))}})
 
 (defn -main
   [& args]

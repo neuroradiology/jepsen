@@ -2,10 +2,13 @@
   (:require [clojure.test :refer :all]
             [clojure.pprint :refer [pprint]]
             [clojure.set :as set]
+            [jepsen [common-test :refer [quiet-logging]]]
             [jepsen.independent :refer :all]
             [jepsen.checker :as checker]
             [jepsen.generator :as gen]
             [jepsen.generator-test :as gen-test :refer [ops]]))
+
+(use-fixtures :once quiet-logging)
 
 (deftest sequential-generator-test
   (testing "empty keys"
@@ -52,13 +55,13 @@
   (testing "Too few threads"
     (is (thrown-with-msg?
           Exception
-          #"With 10 worker threads and 5 nodes, you can only run 2 keys concurrently, but you requested 3 concurrent keys from jepsen\.independent/concurrent-generator"
-          (ops (range 10) (concurrent-generator 3 [] identity)))))
+          #"With 10 worker threads, this jepsen\.concurrent/concurrent-generator cannot run a key with 12 threads concurrently\. Consider raising your test's :concurrency to at least 12\."
+          (ops (range 10) (concurrent-generator 12 [] identity)))))
 
   (testing "Uneven threads"
     (is (thrown-with-msg?
           Exception
-          #"This jepsen\.independent/concurrent-generator has 11 threads to work with, but can only use 10 of those threads to run 2 concurrent keys with 5 threads apiece\. Consider raising or lowering the test's :concurrency to a multiple of 5\."
+          #"This jepsen\.independent/concurrent-generator has 11 threads to work with, but can only use 10 of those threads to run 5 concurrent keys with 2 threads apiece\. Consider raising or lowering the test's :concurrency to a multiple of 2\."
           (ops (range 11) (concurrent-generator 2 [] identity)))))
 
   (testing "Fully concurrent"
@@ -77,7 +80,7 @@
 
 (deftest checker-test
   (let [even-checker (reify checker/Checker
-                       (check [this test model history opts]
+                       (check [this test history opts]
                          {:valid? (even? (count history))}))
         history (->> (fn [k] (->> (range k)
                                   (map (partial array-map :value))
@@ -93,6 +96,5 @@
            (checker/check (checker even-checker)
                           {:name "independent-checker-test"
                            :start-time 0}
-                          nil
                           history
                           {})))))

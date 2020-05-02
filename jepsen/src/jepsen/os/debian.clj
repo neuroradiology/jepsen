@@ -1,13 +1,14 @@
 (ns jepsen.os.debian
   "Common tasks for Debian boxes."
-  (:use clojure.tools.logging)
   (:require [clojure.set :as set]
+            [clojure.tools.logging :refer [info]]
             [jepsen.util :refer [meh]]
             [jepsen.os :as os]
             [jepsen.control :as c :refer [|]]
             [jepsen.control.util :as cu]
-            [jepsen.control.net :as net]
-            [clojure.string :as str]))
+            [jepsen.net :as net]
+            [clojure.string :as str]
+            [slingshot.slingshot :refer [try+ throw+]]))
 
 (defn setup-hostfile!
   "Makes sure the hostfile has a loopback entry for the local hostname"
@@ -51,6 +52,7 @@
          (map (fn [line] (str/split line #"\s+")))
          (filter #(= "install" (second %)))
          (map first)
+         (map (fn [p] (str/replace p #":amd64|:i386" {":amd64" "" ":i386" ""})))
          set)))
 
 (defn uninstall!
@@ -86,7 +88,7 @@
       (for [[pkg version] pkgs]
         (when (not= version (installed-version pkg))
           (info "Installing" pkg version)
-          (c/exec :apt-get :install :-y :--force-yes
+          (c/exec :env "DEBIAN_FRONTEND=noninteractive" :apt-get :install :-y :--force-yes
                   (str (name pkg) "=" version)))))
 
     ; Install any version
@@ -95,7 +97,8 @@
       (when-not (empty? missing)
         (c/su
           (info "Installing" missing)
-          (apply c/exec :apt-get :install :-y :--force-yes missing))))))
+          (apply c/exec :env "DEBIAN_FRONTEND=noninteractive"
+                 :apt-get :install :-y :--force-yes missing))))))
 
 (defn add-key!
   "Receives an apt key from the given keyserver."
@@ -134,34 +137,50 @@
     (install [:oracle-java8-installer])
     (install [:oracle-java8-set-default])))
 
-(def os
-  (reify os/OS
-    (setup! [_ test node]
-      (info node "setting up debian")
+(defn install-jdk11!
+  "Installs an openjdk jdk11 via stretch-backports."
+  []
+  (c/su
+    (add-repo!
+      "stretch-backports"
+      "deb http://deb.debian.org/debian stretch-backports main")
+    (install [:openjdk-11-jdk])))
 
-      (setup-hostfile!)
+(deftype Debian []
+  os/OS
+  (setup! [_ test node]
+    (info node "setting up debian")
 
-      (maybe-update!)
+    (setup-hostfile!)
 
-      (c/su
-        ; Packages!
-        (install [:wget
-                  :curl
-                  :vim
-                  :man-db
-                  :faketime
-                  :ntpdate
-                  :unzip
-                  :iptables
-                  :psmisc
-                  :tar
-                  :bzip2
-                  :libzip2
-                  :iputils-ping
-                  :iproute
-                  :rsyslog
-                  :logrotate]))
+    (maybe-update!)
 
-      (meh (net/heal)))
+    (c/su
+      ; Packages!
+      (install [:apt-transport-https
+                :wget
+                :curl
+                :vim
+                :man-db
+                :faketime
+                :ntpdate
+                :unzip
+                :iptables
+                :psmisc
+                :tar
+                :bzip2
+                :iputils-ping
+                :iproute2
+                :rsyslog
+                :logrotate
+                :dirmngr])
+      (try+ (install [:libzip4])
+            (catch [:exit 100] _
+              ; Wrong package name; let's use the old one for jessie
+              (install [:libzip2]))))
 
-    (teardown! [_ test node])))
+    (meh (net/heal! (:net test) test)))
+
+  (teardown! [_ test node]))
+
+(def os "An implementation of the Debian OS." (Debian.))
